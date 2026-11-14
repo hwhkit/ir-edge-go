@@ -19,7 +19,7 @@ AGENT_KEY="${AGENT_KEY:?need agent signing key or cluster subkey}"
 CLUSTER="${CLUSTER:-}"
 MAX_SLOTS="${MAX_SLOTS:-5}"
 POOL="${POOL_DIR:?need POOL_DIR (ir-pool working dir)}"
-RUN_TASK_ORIG="${RUN_TASK_ORIG:?need RUN_TASK_ORIG (原 dispatcher 版 run-task.sh 路径)}"
+RUN_TASK_ORIG="${RUN_TASK_ORIG:-}"   # 可选：提供时对原版打补丁复用；不提供则使用池目录内已备好的 run-task.sh（install.sh 部署）
 # 兼容保留（DeAlan 遗留变量，本脚本不再读）：超时由服务端 executionDeadline/reaper 全托管
 TASK_TIMEOUT_SECS="${TASK_TIMEOUT_SECS:-600}"
 
@@ -84,6 +84,11 @@ auth_headers() {
 # 特征码双校验（上报行 + d= 行任一未命中即拒绝启动）；源文件更新自动重打。
 # ---------------------------------------------------------------------------
 prepare_patched() {
+  # 未提供原管线时跳过补丁（install.sh/演示管线已把执行器放好）。
+  if [ -z "$RUN_TASK_ORIG" ]; then
+    [ -f "$POOL/run-task.sh" ] || log "WARN  无 run-task.sh（RUN_TASK_ORIG 未设且池目录缺失执行器）"
+    return 0
+  fi
   local dst="$POOL/run-task.sh"
   if [ -f "$dst" ] && grep -q "IR-PATCHED" "$dst" && [ "$RUN_TASK_ORIG" -nt "$dst" ]; then
     log "patch  源 run-task.sh 更新，重新打补丁"
