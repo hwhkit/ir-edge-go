@@ -6,8 +6,9 @@
 #   槽位   本地并发计数 + 服务端租约（SKIP LOCKED 独占）——不再需要 slots/N.lock
 #   重派   服务端 reaper 全托管（attempts/墙钟/孤儿）——本地无超时监视/孤儿扫描
 #   停用   renew 回执 abort:true → 杀进程组放弃（管理台停用即生效）
-#   执行   原管线复用：启动时对原 run-task.sh 打补丁（上报行改为落盘 ir-result.json），
-#          本脚本读补丁版结果转 IR complete（幂等，重试 5 次 2/4/6/8s + undelivered 留档）
+#   执行   原管线复用：启动时对原 run-task.sh 打补丁（运行目录 d= 行改挂 POOL_DIR +
+#          dispatcher 上报行改为落盘 ir-result.json），本脚本读补丁版结果转 IR complete
+#          （幂等，重试 5 次 2/4/6/8s + undelivered 留档）
 #
 # 依赖：bash jq curl；机器上原 sec03 管线照常（RUN_TASK_ORIG 指向原版）。
 set -u
@@ -19,6 +20,7 @@ CLUSTER="${CLUSTER:-}"
 MAX_SLOTS="${MAX_SLOTS:-5}"
 POOL="${POOL_DIR:?need POOL_DIR (ir-pool working dir)}"
 RUN_TASK_ORIG="${RUN_TASK_ORIG:?need RUN_TASK_ORIG (原 dispatcher 版 run-task.sh 路径)}"
+# 兼容保留（DeAlan 遗留变量，本脚本不再读）：超时由服务端 executionDeadline/reaper 全托管
 TASK_TIMEOUT_SECS="${TASK_TIMEOUT_SECS:-600}"
 
 worker_id() { # 服务端校验 [a-z0-9-]{2,64}
@@ -30,12 +32,24 @@ WORKER_ID=$(worker_id)
 
 log() { echo "$(date "+%Y-%m-%dT%H:%M:%S%z") $*"; }
 
+# 启动校验：worker_id 服务端校验 [a-z0-9-]{2,64}（不合法时 heartbeat/claim 全 400，尽早暴露）；
+# MAX_SLOTS 必须为正整数（0 会使 slot 派生除零）。
+printf '%s' "$WORKER_ID" | grep -qE '^[a-z0-9-]{2,64}$' || {
+  echo "FATAL  worker_id 非法: '$WORKER_ID'（由 CLUSTER/AGENT_SLUG 派生，须 [a-z0-9-]{2,64}）" >&2
+  exit 1
+}
+case "$MAX_SLOTS" in '' | *[!0-9]* | 0)
+  echo "FATAL  MAX_SLOTS 必须为正整数: '$MAX_SLOTS'" >&2
+  exit 1 ;;
+esac
+
 # api: $1=path $2=body(可空) → REPLY_BODY(响应体)/REPLY_STATUS(HTTP 码)。
 # 直接调用（不经命令替换——$() 子 shell 会丢副作用变量）。临时文件用 mktemp：
 # 主循环 claim / 后台 heartbeat+renew 并发调用不可共用固定名（$$ 在子 shell
 # 里不变、各自计数会交错——曾因此互相删除响应体）。
-api() { # $1=path $2=body $3=额外头（\n 分隔，可空）
+api() { # $1=path $2=body $3=额外头（\n 分隔，可空）。调用方必读 REPLY_STATUS/REPLY_BODY。
   local path="$1" body="${2:-}" tmp code args=() hdr
+  REPLY_STATUS=000 REPLY_BODY=""   # 提前返回路径（mktemp 失败等）下调用方不会踩 set -u
   tmp=$(mktemp /tmp/ir-pool.XXXXXX) || return 0
   code=$(mktemp /tmp/ir-poolc.XXXXXX) || { rm -f "$tmp"; return 0; }
   while IFS= read -r hdr; do args+=(-H "$hdr"); done < <(auth_headers)
@@ -60,8 +74,14 @@ auth_headers() {
 }
 
 # ---------------------------------------------------------------------------
-# 原管线补丁：把 run-task.sh 的 dispatcher 上报替换为落盘，其余逐字节保留。
-# 特征码校验对齐 deploy.sh 的部署习惯；源文件更新（mtime 更新）自动重打。
+# 原管线补丁，三处替换，其余逐字节保留：
+#   1. AGENT_KEY 必填 → 可缺省（池侧凭据不进子进程硬校验）
+#   2. 运行目录 d= 行改挂 POOL_DIR（原脚本内部 POOL 硬编码 $HOME/pi-workers
+#      或 $HOME/claude-pool——不重定向则 done/ir-result 落在旧目录，本脚本
+#      永远等不到结果；POOL_DIR 未设时回退原值，手工单独运行行为不变）
+#   3. dispatcher 上报行 post_result（含缩进的 runner fast-fail 分支）替换为
+#      落盘 ir-result.json（缩进分支不替换会把任务载荷 POST 给旧平台端点）
+# 特征码双校验（上报行 + d= 行任一未命中即拒绝启动）；源文件更新自动重打。
 # ---------------------------------------------------------------------------
 prepare_patched() {
   local dst="$POOL/run-task.sh"
@@ -70,12 +90,16 @@ prepare_patched() {
     rm -f "$dst"
   fi
   if [ ! -f "$dst" ]; then
-    sed -e 's|AGENT_KEY="${AGENT_KEY:?need nodek_ key}"|AGENT_KEY="${AGENT_KEY:-}"|' \
-        -e 's|^post_result "\$payload"$|printf "%s" "$payload" > "$d/ir-result.json"  # IR-PATCHED|' \
+    sed -e 's,AGENT_KEY="${AGENT_KEY:?need nodek_ key}",AGENT_KEY="${AGENT_KEY:-}",' \
+        -e 's,^d="\$POOL/runs/\$tid".*,d="${POOL_DIR:-$POOL}/runs/$tid"; mkdir -p "$d"; cd "$d" || exit 1  # IR-PATCHED,' \
+        -e 's,^\( *\)post_result "\$payload"$,\1printf "%s" "$payload" > "$d/ir-result.json"  # IR-PATCHED,' \
         "$RUN_TASK_ORIG" > "$dst.tmp" || {
       log "FATAL  打补丁失败: $RUN_TASK_ORIG 不可读"; exit 1;
     }
-    grep -q "IR-PATCHED" "$dst.tmp" || {
+    grep -q 'POOL_DIR:-' "$dst.tmp" || {
+      log "FATAL  补丁未命中（run-task.sh 的运行目录 d= 行已变化），拒绝启动"; exit 1;
+    }
+    grep -q '^printf "%s" "\$payload" > "\$d/ir-result.json"' "$dst.tmp" || {
       log "FATAL  补丁未命中（原脚本上报行已变化），拒绝启动"; exit 1;
     }
     mv "$dst.tmp" "$dst"
@@ -151,6 +175,27 @@ except Exception:
 run_worker() {
   local runId="$1" renewAfter="$2" deadline="$3" tf="$4"
   local d="$POOL/runs/$runId" slot=$((RANDOM % MAX_SLOTS + 1))
+  local runhdr; runhdr=$(printf 'X-Agent-Run-ID: %s\nX-Agent-Worker-ID: %s' "$runId" "$WORKER_ID")
+
+  # 契约 §12.2：执行前先续一次租。409（LEASE_LOST/TASK_DEADLINE_EXCEEDED）/404
+  # → 任务已重派/终态，不启动本地执行；abort:true → 直接终局回执。
+  api "/renew" "" "$runhdr"
+  case "$REPLY_STATUS" in
+    200)
+      if jq -e '.abort == true' <<<"$REPLY_BODY" >/dev/null 2>&1; then
+        log "ABORT  runId=$runId 启动前续租即被取消 → complete(aborted)"
+        report_ir_complete "$runId" '{"status":"aborted"}'
+        rm -f "$tf"
+        return 0
+      fi
+      ;;
+    409 | 404)
+      log "SKIP   runId=$runId 启动前续租 $REPLY_STATUS → 租约失效/已重派，放弃"
+      rm -f "$tf"
+      return 0
+      ;;
+  esac
+
   mkdir -p "$d"
   if [ -n "$START_BACKEND" ]; then
     setsid nohup "$POOL/run-task.sh" "$runId" "$slot" <"$tf" >>"$POOL/pool.log" 2>&1 &
@@ -158,6 +203,7 @@ run_worker() {
     nohup "$POOL/run-task.sh" "$runId" "$slot" <"$tf" >>"$POOL/pool.log" 2>&1 &
   fi
   local pid=$!
+  rm -f "$tf"   # stdin 重定向的 fd 已打开，删除路径安全（否则 claim.*.json 无限堆积）
   log "dispatch runId=$runId slot=$slot renewAfter=${renewAfter}s pid=$pid backend=${START_BACKEND:-plain}"
 
   local deadEpoch; deadEpoch=$(deadline_epoch "$deadline")
@@ -174,7 +220,7 @@ run_worker() {
     elapsed=$((elapsed + 2))
     if [ "$elapsed" -lt "$nextRenew" ]; then continue; fi
     nextRenew=$((nextRenew + renewAfter))
-    api "/renew" ""
+    api "/renew" "" "$runhdr"   # 契约 §2：run/worker 标识走头，无请求体
     local rbody="$REPLY_BODY"
     case "$REPLY_STATUS" in
       200)
@@ -215,12 +261,15 @@ run_worker() {
     if [ "$rstatus" = "completed" ] || [ "$rstatus" = "succeeded" ]; then
       # usage 转换：原管线 BoundRunUsage(promptTokens/completionTokens/totalTokens)
       # → IR camelCase 计量契约；totalTokens 必填（RULE-BND-001，兜底 > 0）。
+      # 注意 $p 引用（.p 是 jq 输入的字段，恒 null——曾致 payload 恒 null 的critical bug）；
+      # usage 在原管线位于 result.usage（top-level usage 仅兜底）。
       payload=$(jq -n --argjson p "$(cat "$d/ir-result.json")" '
+        (($p.result.usage // $p.usage) // {}) as $u |
         {status:"succeeded",
-         payload:(.p.result // .p),
-         usage:{inputTokens:(.p.usage.promptTokens // .p.usage.inputTokens // 0),
-                outputTokens:(.p.usage.completionTokens // .p.usage.outputTokens // 0),
-                totalTokens:(.p.usage.totalTokens // ((.p.usage.promptTokens // 0) + (.p.usage.completionTokens // 0) + 1))},
+         payload:($p.result // $p),
+         usage:{inputTokens:($u.promptTokens // $u.inputTokens // 0),
+                outputTokens:($u.completionTokens // $u.outputTokens // 0),
+                totalTokens:($u.totalTokens // (($u.promptTokens // $u.inputTokens // 0) + ($u.completionTokens // $u.outputTokens // 0) + 1))},
          metrics:{durationMs:0}}')
     else
       local emsg
@@ -240,17 +289,23 @@ run_worker() {
 }
 
 # heartbeat 独立循环：容量上报 + 服务端自适应间隔；401 即退出（密钥失效）。
+# inFlight 读主循环落盘快照（$POOL/.inflight）——本函数是独立子进程，fork 后
+# 的变量快照永久冻结，直接调 in_flight 只会永远上报 0。
 run_heartbeat() {
   local interval=60
   while true; do
-    local body rbody want
-    body=$(jq -n --arg w "$WORKER_ID" --argjson f "$(in_flight)" --argjson c "$MAX_SLOTS" \
+    local body want nf
+    # cat 而非 read：文件无换行结尾时 read 置变量成功但退出码非 0，`|| nf=0` 会把值冲掉
+    nf=$(cat "$POOL/.inflight" 2>/dev/null)
+    case "$nf" in '' | *[!0-9]*) nf=0 ;; esac
+    body=$(jq -n --arg w "$WORKER_ID" --argjson f "$nf" --argjson c "$MAX_SLOTS" \
       --arg s "$AGENT_SLUG" \
       '{workerId:$w, inFlight:$f, capacity:$c, capabilities:{slugs:[$s], version:"agent-pool/1"}}')
     api "/heartbeat" "$body"
     if [ "$REPLY_STATUS" = "200" ]; then
       want=$(jq -r '.heartbeatIntervalSeconds // 60' <<<"$REPLY_BODY" 2>/dev/null)
       case "$want" in ''|*[!0-9]*) want=60 ;; esac
+      [ "$want" -lt 1 ] && want=60        # 0 会退化成忙等请求风暴
       [ "$want" -gt 3600 ] && want=3600
       interval=$want
     elif [ "$REPLY_STATUS" = "401" ]; then
@@ -261,14 +316,22 @@ run_heartbeat() {
   done
 }
 
+# 退出清理：kill heartbeat 子进程。TERM/INT 也要走 EXIT trap——bash 收到未捕获
+# 的 TERM 会立即死、不执行 EXIT trap，heartbeat 就会变孤儿继续打心跳。
+cleanup() { kill "${HEARTBEAT_PID:-}" 2>/dev/null; }
+trap 'cleanup; exit 0' EXIT
+trap 'exit 0' TERM INT
 run_heartbeat &
 HEARTBEAT_PID=$!
-trap 'kill "$HEARTBEAT_PID" 2>/dev/null' EXIT
 
 log "start  worker=$WORKER_ID slug=$AGENT_SLUG slots=$MAX_SLOTS server=$IR_SERVER"
 while true; do
   in_flight >/dev/null   # 顺带回收已退出的 worker pid
   local_free=$(in_flight)
+  # inFlight 快照落盘给 heartbeat 子进程读（原子替换，避免半写状态）
+  printf '%s' "$local_free" > "$POOL/.inflight.tmp" 2>/dev/null &&
+    mv "$POOL/.inflight.tmp" "$POOL/.inflight" 2>/dev/null
+  find "$POOL/runs" -mindepth 1 -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null
   if [ "$local_free" -lt "$MAX_SLOTS" ]; then
     body=$(jq -n --arg w "$WORKER_ID" --argjson f "$local_free" --argjson c "$MAX_SLOTS" \
       --arg s "$AGENT_SLUG" \
@@ -277,6 +340,12 @@ while true; do
     case "$REPLY_STATUS" in
       200)
         runId=$(jq -r '.runId' <<<"$REPLY_BODY" 2>/dev/null)
+        # claim 响应字段缺失/非法 JSON 时 jq 会得到 "" 或字面量 null——不设防会派发脏 runId
+        if [ -z "$runId" ] || [ "$runId" = "null" ]; then
+          log "WARN   claim 200 但 runId 缺失，跳过本轮"
+          sleep 1
+          continue
+        fi
         renewAfter=$(jq -r '.renewAfterSeconds // 30' <<<"$REPLY_BODY" 2>/dev/null)
         deadline=$(jq -r '.executionDeadline // ""' <<<"$REPLY_BODY" 2>/dev/null)
         attempts=$(jq -r '.attempts // 1' <<<"$REPLY_BODY" 2>/dev/null)
@@ -288,18 +357,27 @@ while true; do
           '{task_id:$id,
             prompt:(if ($in.taskBrief // "" | length) > 0 then $in.taskBrief else ($in | tostring) end),
             input:($in.params // {})}' > "$tf"
+        if [ ! -s "$tf" ]; then
+          log "WARN   runId=$runId 任务文件构造失败（input 非法?），跳过"
+          rm -f "$tf"
+          sleep 1
+          continue
+        fi
         run_worker "$runId" "$renewAfter" "$deadline" "$tf" &
         running_workers+=($!)
         ;;
-      204) ;;      # 空队列：立即重新 claim（长轮询窗口内服务端持有）
-      429) sleep 2 ;;
+      204) continue ;;   # 空队列：契约 §1 立即重新 claim（长轮询窗口服务端持有，勿加 sleep）
+      429) sleep 2 ;;    # 契约建议按 Retry-After 退避；固定 2s 保守兜底
       401)
-        log "FATAL  claim 401：密钥无效/被吊销/Scope 不符，退出"
+        log "FATAL  claim 401：密钥无效/被吊销，退出"
+        exit 1
+        ;;
+      403)
+        log "FATAL  claim 403：令牌 scope 不含任何可用 slug（配置错误），退出"
         exit 1
         ;;
       *) sleep 1 ;;
     esac
   fi
-  find "$POOL/runs" -mindepth 1 -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null
   sleep 1
 done

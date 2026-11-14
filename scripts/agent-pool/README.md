@@ -47,7 +47,7 @@ set -a; . ./pool-env; set +a
 | 3. 停用语义（200 空队列无感知） | 管理台停用智能体 → claim 204（`X-Agent-Api-Reason: no-scope-match`）；执行中 renew 回 `abort:true` → 本脚本杀进程组 |
 | 4. agent_tag 定向（漏配静默饿死） | `X-Agent-Slug` + `preferredSlugs` 显式定向；不匹配时 204 带诊断头，无饿死陷阱 |
 | 5. 三败即死 + 300s 主管杀 | 服务端 `attempts`（MAX_ATTEMPTS=3）+ `executionDeadline` 墙钟（renew 409 TASK_DEADLINE_EXCEEDED）；本地仅杀进程组兜底 |
-| 6. sec03 管线 | **原样保留**：原 run-task.sh 打补丁复用（仅"上报 dispatcher"一行替换为落盘 `ir-result.json`），启动时按源 mtime 自动重打 |
+| 6. sec03 管线 | **原样保留**：原 run-task.sh 打补丁复用（运行目录 `d=` 行改挂 `POOL_DIR` + 两处"上报 dispatcher"行替换为落盘 `ir-result.json`，双特征码校验），启动时按源 mtime 自动重打 |
 
 ## 与 dispatcher 版的切换
 

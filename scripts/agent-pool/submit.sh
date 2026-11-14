@@ -12,14 +12,30 @@ AGENT_KEY="${AGENT_KEY:?need agent signing key or cluster subkey}"
 CLUSTER="${CLUSTER:-}"
 
 slug="" status="succeeded" runId="" payloadFile="" inputFile="" errorCode=""
-while getopts "s:p:i:r:c:" opt; do
+# 手工解析：文档化的长名（-slug/-status/-payload/-input/-runid/-code）与短名（-s/-p/-i/-r/-c）
+# 双兼容。原 getopts "s:p:i:r:c:" 版会静默错解长名（"-slug x" 被当作 -s 取值 "lug"），
+# 且 -status 根本没有对应字母位——status 永远是默认 succeeded。
+usage() { echo "usage: submit.sh -slug S -status succeeded|failed -payload FILE|- [-input FILE] [-runid ID] [-code CODE]" >&2; }
+while [ $# -gt 0 ]; do
+  opt="$1"
   case "$opt" in
-    s) slug="$OPTARG" ;;
-    p) payloadFile="$OPTARG" ;;
-    i) inputFile="$OPTARG" ;;
-    r) runId="$OPTARG" ;;
-    c) errorCode="$OPTARG" ;;
-    *) echo "usage: submit.sh -slug S -status succeeded|failed -payload FILE|- [-input FILE] [-runid ID] [-code CODE]" >&2; exit 2 ;;
+    -slug | -status | -payload | -input | -runid | -code | -s | -p | -i | -r | -c) ;;
+    *) usage; exit 2 ;;
+  esac
+  if [ $# -lt 2 ]; then
+    echo "missing value for $opt" >&2
+    usage
+    exit 2
+  fi
+  val="$2"
+  shift 2
+  case "$opt" in
+    -slug | -s) slug="$val" ;;
+    -status) status="$val" ;;
+    -payload | -p) payloadFile="$val" ;;
+    -input | -i) inputFile="$val" ;;
+    -runid | -r) runId="$val" ;;
+    -code | -c) errorCode="$val" ;;
   esac
 done
 [ -n "$slug" ] || slug="$AGENT_SLUG_DEFAULT"
@@ -40,6 +56,17 @@ input="null"
 if [ -n "$inputFile" ]; then
   input=$(cat "$inputFile")
 fi
+
+# 本地先校验 JSON：原来非法 JSON 会被 --argjson 静默吞掉、以空体发给平台吃 400。
+# 用 jq empty（纯解析，不带 -e——null/false 也是合法 JSON）
+jq empty <<<"$payload" >/dev/null 2>&1 || {
+  echo "payload is not valid JSON (from ${payloadFile:--}): ${payload:0:200}" >&2
+  exit 2
+}
+jq empty <<<"$input" >/dev/null 2>&1 || {
+  echo "input is not valid JSON (from $inputFile): ${input:0:200}" >&2
+  exit 2
+}
 
 body=$(jq -n --arg slug "$slug" --arg status "$status" --arg runId "$runId" \
   --argjson payload "$payload" --argjson input "$input" --arg code "$errorCode" \
