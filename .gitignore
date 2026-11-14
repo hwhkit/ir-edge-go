@@ -1,0 +1,10 @@
+# 构建产物
+dist/
+*.test
+# 本地凭据与配置（永不入库）
+*.key
+agentd.yaml
+pool-env
+.env*
+# Go
+.gocache/
