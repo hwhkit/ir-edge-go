@@ -46,8 +46,8 @@ scripts/agent-pool/     bash 版池连接器（无 Go 环境机器用；语义�
 
 ## 里程碑
 
-1. 骨架 + 配置/密钥/客户端 infra（本提交）
-2. daemon 内核（多 Agent 路由 + Exec/HTTP 执行器 + 热重载）
-3. 本地 Web 控制台（API + 内嵌 UI）
-4. 子命令补齐 + service install（systemd/launchd）
-5. goreleaser + brew tap + install.sh
+1. ✅ 骨架（cmd/domain/app/api/localweb 分层就位；infra 三件套为 doc 占位）
+2. ✅ bash 连接器（scripts/agent-pool，已实测：docker 闭环 + 18 项审查修复）+ 一键部署（deploy/install.sh）
+3. daemon 内核（多 Agent 路由 + Exec/HTTP 执行器 + 热重载）——当前里程碑
+4. 本地 Web 控制台（Node Console，127.0.0.1:7800）
+5. 子命令补齐 + service install + goreleaser/brew 分发
