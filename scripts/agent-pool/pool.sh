@@ -372,7 +372,7 @@ while true; do
         running_workers+=($!)
         ;;
       204) continue ;;   # 空队列：契约 §1 立即重新 claim（长轮询窗口服务端持有，勿加 sleep）
-      429) sleep 2 ;;    # 契约建议按 Retry-After 退避；固定 2s 保守兜底
+      429) sleep "${REPLY_RETRY_AFTER:-2}" ;;    # 尊重服务端 Retry-After 头
       401)
         log "FATAL  claim 401：密钥无效/被吊销，退出"
         exit 1
