@@ -1,4 +1,4 @@
-module ir-agent
+module ir-edge
 
 go 1.26.0
 

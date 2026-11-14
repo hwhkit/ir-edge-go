@@ -1,4 +1,25 @@
-# ir-agent-go
+# IR Edge
+
+**IR（Intelligent Router，智能路由）** 的机器端程序：`ir` —— 单二进制 = CLI + 常驻 daemon（ir-noded）+ 本地 Web 控制台（127.0.0.1:7800，Node Console）。
+
+## 术语体系（IR 家族）
+
+| 术语 | 中文 | 指代 |
+|---|---|---|
+| **IR** | 智能路由 | 整个产品伞形品牌 |
+| **IR Core** | 核心路由器（控制面） | 平台服务端（repo `agent-server-go`） |
+| **IR Edge** | 边缘路由器（执行节点） | 本仓库——机器端程序 |
+| **IR Mesh** | 智能体组网 | Core + 全部 Edge 构成的分布式网络 |
+| **IR Link** | 链路协议 | agent-api/v1 的协议名（契约见 Core 仓库 doc/） |
+| **ir-noded** | 节点守护进程 | `ir daemon` 的服务形态 |
+| **Node Console** | 节点控制台 | 127.0.0.1:7800 本机 Web |
+| **Central Console** | 中央控制台 | Core 的管理台 SPA |
+| **Node Key** | 节点密钥 | 智能体主密钥（入站签名 + 连接认证） |
+| **Cluster Key** | 集群子密钥 | Node Key 的 HMAC 派生（按集群吊销） |
+| **Fleet** | 机群 | 一台 Edge 上的执行池（DeAlan pi-pool/cc-pool 的继任概念） |
+| **Run** | 运行 | 一次任务执行（全程审计） |
+| **Position / Team** | 岗位 / 编排 | 业务层概念（Core 管理） |
+
 
 Intelligent Router 的机器端程序：`ir` —— 单二进制 = CLI + 常驻 daemon + 本地 Web 控制台（127.0.0.1:7800）。
 
