@@ -1,0 +1,81 @@
+# IR Edge — Kubernetes 部署清单
+#
+# 用法：
+#   kubectl apply -f deploy/k8s-edge.yaml
+#
+# 前提：
+#   1. 在 Core 管理台创建智能体，记下 slug 和签名密钥
+#   2. 创建 Secret：kubectl create secret generic ir-edge-secrets \
+#        --from-literal=AGENT_KEY=<签名密钥>
+#   3. 按需调整 replicas 和 resources
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ir-edge-config
+data:
+  AGENT_SLUG: "fundamental-analyst"
+  CLUSTER: "k8s-edge"
+  MAX_SLOTS: "4"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ir-edge
+  labels: {app: ir-edge}
+spec:
+  replicas: 3  # 按负载调扩
+  selector:
+    matchLabels: {app: ir-edge}
+  template:
+    metadata:
+      labels: {app: ir-edge}
+    spec:
+      containers:
+        - name: ir-edge
+          image: ghcr.io/hwhkit/ir-edge:latest
+          envFrom:
+            - configMapRef: {name: ir-edge-config}
+            - secretRef: {name: ir-edge-secrets}
+          env:
+            - name: IR_SERVER
+              value: "https://ir.example.com"
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          livenessProbe:
+            exec: {command: ["/bin/sh", "-c", "kill -0 1"]}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            exec: {command: ["/bin/sh", "-c", "test -f /pool/.healthy"]}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+# HPA：根据 CPU 自动扩缩（需 metrics-server）
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ir-edge-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ir-edge
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+---
+# PodDisruptionBudget：滚动更新时保底可用
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ir-edge-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: ir-edge}
