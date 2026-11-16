@@ -1,33 +1,143 @@
-// ir —— Intelligent Router 的机器端程序：CLI + 常驻 daemon + 本地 Web 控制台。
+// ir — IR Edge 机器端程序：CLI + 常驻 daemon + Node Console（127.0.0.1:7800）。
 //
-// 单二进制两种形态：
+// 用法：
 //
-//	ir daemon            常驻：连接平台 agent-api（claim/renew/complete/heartbeat），
-//	                     按本机路由表把任务派发给对应的 Agent（exec/HTTP）
-//	ir init / agents …   配置与管理子命令
-//	（daemon 内嵌本地 Web 控制台 127.0.0.1:7800，配置与状态查看双入口之一）
-//
-// 与平台的关系：只通过 agent-api HTTP 协议通信（契约见平台仓库
-// doc/AGENT-PULL-API.md），不依赖平台任何内部包——两个项目独立演进。
+//	ir daemon --config agentd.yaml          # 启动守护进程 + Node Console
+//	ir daemon -s https://ir.example.com -slug my-agent -key <key> -exec "python3 a.py"
+//	ir version
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"ir-edge/internal/api/localweb"
+	"ir-edge/internal/app/daemon"
+	"ir-edge/internal/infra/nodecfg"
 )
 
-const version = "dev"
+const version = "0.1.0"
 
 func main() {
-	fs := flag.NewFlagSet("ir", flag.ExitOnError)
-	showVersion := fs.Bool("version", false, "print version")
-	_ = fs.Parse(os.Args[1:])
-	if *showVersion {
-		fmt.Println("ir", version)
-		return
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
 	}
-	fmt.Fprintln(os.Stderr, "ir: 子命令实现见 internal/app/agentd（骨架阶段）")
-	fmt.Fprintln(os.Stderr, "  计划子命令: init / agents add|list|remove|test / daemon / service install / status / submit")
-	os.Exit(2)
+	switch os.Args[1] {
+	case "daemon":
+		runDaemon(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Println("ir", version)
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, `ir — IR Edge machine-side agent
+
+Usage:
+  ir daemon [flags]        Start the daemon + Node Console (127.0.0.1:7800)
+  ir version                Show version
+
+Daemon flags:
+  --config <path>           Path to agentd.yaml (recommended)
+  --server <url>            IR Core address (required if no --config)
+  --slug <slug>             Agent slug (required if no --config)
+  --key <key>               Agent signing key (required if no --config)
+  --cluster <id>            Cluster identifier (default: hostname)
+  --exec <cmd>              Execution command (default: demo echo)
+  --capacity <n>            Concurrent slots (default: 2)
+  --port <n>                Node Console port (default: 7800)
+
+Example:
+  ir daemon --config /etc/ir/agentd.yaml
+  ir daemon -s https://ir.example.com -slug analyst -key abc123 -exec "python3 /opt/analyst.py"`)
+}
+
+func runDaemon(args []string) {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	cfgPath := fs.String("config", "", "path to agentd.yaml")
+	server := fs.String("server", "", "IR Core address")
+	slug := fs.String("slug", "", "agent slug")
+	key := fs.String("key", "", "agent signing key")
+	cluster := fs.String("cluster", "", "cluster id")
+	execCmd := fs.String("exec", "", "execution command")
+	capacity := fs.Int("capacity", 2, "concurrent slots")
+	port := fs.Int("port", 7800, "node console port")
+	fs.Parse(args)
+
+	var cfg *nodecfg.Config
+	var err error
+
+	if *cfgPath != "" {
+		cfg, err = nodecfg.Load(*cfgPath)
+		if err != nil {
+			slog.Error("load config", "err", err)
+			os.Exit(1)
+		}
+	} else {
+		// 命令行模式：构造单 agent 配置
+		if *server == "" || *slug == "" || *key == "" {
+			slog.Error("daemon requires --server, --slug, --key (or --config)")
+			os.Exit(1)
+		}
+		if *cluster == "" {
+			hostname, _ := os.Hostname()
+			*cluster = hostname
+		}
+		exec := []string{"echo", `{"demo":true}`}
+		if *execCmd != "" {
+			exec = []string{"sh", "-c", *execCmd}
+		}
+		cfg = &nodecfg.Config{
+			Server:  *server,
+			Cluster: *cluster,
+			Port:    *port,
+			Agents: []nodecfg.AgentDef{{
+				Slug: *slug, Key: *key, Capacity: *capacity, TimeoutSecs: 600, Exec: exec,
+			}},
+		}
+	}
+	if cfg.Port == 0 {
+		cfg.Port = *port
+	}
+
+	// 启动 daemon
+	ctx, cancel := context.WithCancel(context.Background())
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		slog.Info("shutting down...")
+		cancel()
+	}()
+
+	d := daemon.NewDaemon(cfg)
+	d.Start(ctx)
+
+	// Node Console
+	consoleAddr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	consoleHandler := localweb.NewHandler(d)
+	consoleSrv := &http.Server{
+		Addr:    consoleAddr,
+		Handler: consoleHandler.Router(),
+	}
+	go func() {
+		slog.Info("node console", "addr", "http://"+consoleAddr)
+		if err := consoleSrv.ListenAndServe(); err != http.ErrServerClosed {
+			slog.Error("console server", "err", err)
+		}
+	}()
+
+	<-ctx.Done()
+	consoleSrv.Shutdown(context.Background())
+	d.Stop()
 }
